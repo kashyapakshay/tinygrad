@@ -15,18 +15,13 @@ max_epochs = 32
 Tensor.training = True
 train_loader, val_loader = get_data_loaders('extra/datasets/kits19/processed_data')
 model = UNet3D()
-# optimizer = optim.SGD(get_parameters(model), lr=init_lr)
+optimizer = optim.SGD(get_parameters(model), lr=init_lr)
 for i, (X, y_true) in enumerate(tqdm(train_loader)):
-	# optimizer.zero_grad()
+	optimizer.zero_grad()
 
 	X = Tensor(X).half()
 	y_pred = model(X)
 
-	print(y_pred.shape)
-	print(y_true.shape)
-
-	# loss = dice_ce_loss(y_pred, y_true)
-	# print(loss.numpy())
-	# loss.backward()
-	# optimizer.step()
-	break
+	loss = dice_ce_loss(y_pred, y_true)
+	loss.backward()
+	optimizer.step()
