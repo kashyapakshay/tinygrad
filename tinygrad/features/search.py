@@ -1,8 +1,9 @@
-from typing import Dict, List, cast, DefaultDict, Optional, Tuple
+from typing import Dict, List, cast, DefaultDict, Optional, Tuple, Callable
+import itertools, random, math
 from tinygrad.lazy import vars_from_ast
 from tinygrad.ops import Device, Compiled, MemBuffer
-from tinygrad.helpers import prod, ImageDType, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context
-from tinygrad.codegen.linearizer import Linearizer
+from tinygrad.helpers import prod, ImageDType, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, all_int
+from tinygrad.codegen.linearizer import Linearizer, UOp
 from tinygrad.runtime.lib import RawBuffer
 from collections import defaultdict
 from tinygrad.tensor import Tensor
@@ -21,14 +22,16 @@ actions += [
 
 # returns time in seconds
 def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=True, max_global_size=65536, cnt=3, disable_cache=False, clear_l2=False) -> float:
-  key = {"ast": str(lin.ast), "opts": str(lin.applied_opts), "allow_test_size": allow_test_size, "max_global_size": max_global_size}
+  key = {"ast": str(lin.ast), "opts": str(lin.applied_opts), "allow_test_size": allow_test_size, "max_global_size": max_global_size, "clear_l2": clear_l2, "device": Device.DEFAULT}
   if not disable_cache and CACHELEVEL >= 2 and (val:=diskcache_get("time_linearizer", key)) is not None: return min(val)
-  var_vals = {k:k.min for k in vars_from_ast(lin.ast)}
+
+  # Set the midpoint value value for var_vals to optimize shapes.
+  var_vals = {k:(k.max+k.min)//2 for k in vars_from_ast(lin.ast)}
   try:
     lin.linearize()
     prg = cast(Compiled, Device[Device.DEFAULT]).to_program(lin)
     real_global_size = prg.global_size
-    if allow_test_size and prg.global_size:
+    if allow_test_size and prg.global_size and all_int(tuple(prg.global_size)):
       test_global_size = prg.global_size[:]
       while prod(test_global_size) > max_global_size:
         for j in range(2,-1,-1):
@@ -40,24 +43,30 @@ def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=Tru
       #print(real_global_size, test_global_size, factor)
     else:
       factor = 1
-    # TODO: this is super broken for var_vals
+
     # TODO: this is copied from prg.__call__
     global_size, local_size = prg.launch_dims(var_vals)
-    if global_size is not None and local_size is None:
-      local_size = prg.optimize_local_size(global_size, rawbufs)
+    if global_size is not None and local_size is None and all_int(tuple(prg.global_size)): # type: ignore[arg-type]
+      local_size = optimize_local_size(prg.clprg, global_size, rawbufs)
       global_size = [g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)]
+
     tms = []
     for _ in range(cnt):
       if clear_l2:
         # TODO: this is too small for many L2 caches
         with Context(DEBUG=0): Tensor.rand(1024,1024).realize()
-      tms.append(prg.clprg(global_size, local_size, *rawbufs, *var_vals.values(), wait=True)*factor)
+      lra = prg.runtime_args.copy()
+      if global_size: lra['global_size'] = global_size
+      if local_size: lra['local_size'] = local_size
+      tms.append(prg.clprg(*rawbufs, *var_vals.values(), **lra, wait=True)*factor)
     prg.global_size = real_global_size
   except Exception:
-    #import traceback; traceback.print_exc()
-    #print("FAILED")
-    #print(lin.ast)
-    #print(lin.applied_opts)
+    if DEBUG >= 4:
+      import traceback
+      traceback.print_exc()
+      print("FAILED")
+      print(lin.ast)
+      print(lin.applied_opts)
     tms = [float('inf')]
   if CACHELEVEL >= 2: diskcache_put("time_linearizer", key, tms)
   return min(tms)
@@ -91,8 +100,10 @@ def get_linearizer_actions(lin:Linearizer, include_0=True) -> Dict[int, Lineariz
       pass
   return acted_lins
 
+def tuplize_uops(uops:List[UOp]) -> Tuple: return tuple([(x.uop, x.dtype, tuple(uops.index(x) for x in x.vin), x.arg) for x in uops])
+
 def beam_search(lin:Linearizer, rawbufs, amt:int, allow_test_size=True) -> Linearizer:
-  key = {"ast": str(lin.ast), "amt": amt, "allow_test_size": allow_test_size}
+  key = {"ast": str(lin.ast), "amt": amt, "allow_test_size": allow_test_size, "device": Device.DEFAULT}
   if (val:=diskcache_get("beam_search", key)) is not None and not getenv("IGNORE_BEAM_CACHE") and CACHELEVEL >= 1:
     ret = lin.copy()
     for o in val[len(lin.applied_opts):]: ret.apply_opt(o)
@@ -102,7 +113,6 @@ def beam_search(lin:Linearizer, rawbufs, amt:int, allow_test_size=True) -> Linea
   beam: List[Tuple[Linearizer, float]] = [(lin, time_linearizer(lin, rawbufs, allow_test_size=allow_test_size))]
 
   # NOTE: real uops use a weird compare method that's only valid inside a linearizer
-  def tuplize_uops(uops): return tuple([(x.uop, x.dtype, tuple(x.num for x in x.vin), x.arg) for x in uops])
   seen_uops = {tuplize_uops(lin.linearize().uops): tuple(lin.applied_opts)}
 
   while 1:
@@ -131,3 +141,17 @@ def beam_search(lin:Linearizer, rawbufs, amt:int, allow_test_size=True) -> Linea
   if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
   if DEBUG >= 3: print(beam[0][0].applied_opts)
   return beam[0][0]
+
+def optimize_local_size(clprg:Callable, global_size:List[int], rawbufs:List[RawBuffer]) -> List[int]:
+  test_rawbuffers = [type(rawbufs[0])(rawbufs[0].size, rawbufs[0].dtype), *rawbufs[1:]] if rawbufs[0] in rawbufs[1:] else rawbufs
+  MAX_WORKGROUP = clprg.max_work_group_size() if hasattr(clprg, 'max_work_group_size') else 1024
+  local_dims = [[x for x in set([sz, 1, 2, 4, 8, 16, 32, 64, 128, 256, MAX_WORKGROUP]) if x<=sz] for sz in global_size]
+  local_sizes = [list(x) for x in itertools.product(*local_dims) if prod(x) <= MAX_WORKGROUP] * 2  # try each valid size twice
+  def try_exec(local_size):
+    try:
+      return clprg(*test_rawbuffers, global_size=[g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)], local_size=local_size, wait=True)
+    except Exception:
+      return float('inf')
+  ret = min([(try_exec(local_size), local_size) for local_size in random.sample(local_sizes, len(local_sizes))])
+  assert not math.isinf(ret[0]), "all optimize_local_size exec failed"
+  return ret[1]

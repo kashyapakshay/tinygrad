@@ -7,7 +7,7 @@ from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.llvmir import uops_to_llvm_ir
 from tinygrad.runtime.lib import RawMallocBuffer
 
-import llvmlite.binding as llvm  # type: ignore
+import llvmlite.binding as llvm
 
 LLVMOPT = bool(getenv("LLVMOPT"))
 
@@ -59,7 +59,7 @@ class LLVMProgram:
     LLVM().engine.add_object_file(llvm.object_file.ObjectFileRef.from_data(lib))
     self.fxn = LLVM.engine.get_function_address(name)
 
-  def __call__(self, unused_global_size, unused_local_size, *bufs, wait=False):
+  def __call__(self, *bufs, wait=False):
     cfunc = CFUNCTYPE(ctypes.c_int, *[ctypes.c_void_p for _ in bufs])(self.fxn)
     if wait: st = time.perf_counter()
     cfunc(*[x._buf if not isinstance(x, int) else x for x in bufs])

@@ -175,7 +175,7 @@ class CrossAttention:
     q,k,v = self.to_q(x), self.to_k(context), self.to_v(context)
     q,k,v = [y.reshape(x.shape[0], -1, self.num_heads, self.head_size).transpose(1,2) for y in (q,k,v)]
     attention = Tensor.scaled_dot_product_attention(q, k, v).transpose(1,2)
-    h_ = attention.reshape(shape=(x.shape[0], -1, self.num_heads * self.head_size))
+    h_ = attention.reshape(x.shape[0], -1, self.num_heads * self.head_size)
     return h_.sequential(self.to_out)
 
 class GEGLU:
@@ -348,29 +348,12 @@ class CLIPAttention:
     self.q_proj = Linear(self.embed_dim, self.embed_dim)
     self.out_proj = Linear(self.embed_dim, self.embed_dim)
 
-  def _shape(self, tensor, seq_len: int, bsz: int):
-    return tensor.reshape(bsz, seq_len, self.num_heads, self.head_dim).permute(0,2,1,3)
-
   def __call__(self, hidden_states, causal_attention_mask):
     bsz, tgt_len, embed_dim = hidden_states.shape
-
-    query_states = self.q_proj(hidden_states)
-    key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-    value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-
-    proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-    query_states = self._shape(query_states, tgt_len, bsz).reshape(*proj_shape)
-    key_states = key_states.reshape(*proj_shape)
-    src_len = key_states.shape[1]
-    value_states = value_states.reshape(*proj_shape)
-
-    attn_output = Tensor.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=causal_attention_mask)
-    attn_output = attn_output.reshape(bsz, self.num_heads, tgt_len, self.head_dim)
-    attn_output = attn_output.permute(0,2,1,3)
-    attn_output = attn_output.reshape(bsz, tgt_len, embed_dim)
-
-    attn_output = self.out_proj(attn_output)
-    return attn_output
+    q,k,v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+    q,k,v = [x.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2) for x in (q,k,v)]
+    attn_output = Tensor.scaled_dot_product_attention(q, k, v, attn_mask=causal_attention_mask)
+    return self.out_proj(attn_output.transpose(1, 2).reshape(bsz, tgt_len, embed_dim))
 
 class CLIPEncoderLayer:
   def __init__(self):
@@ -538,7 +521,44 @@ class StableDiffusion:
     self.first_stage_model = AutoencoderKL()
     self.cond_stage_model = namedtuple("CondStageModel", ["transformer"])(transformer = namedtuple("Transformer", ["text_model"])(text_model = CLIPTextTransformer()))
 
-  # TODO: make __call__ run the model
+  def get_x_prev_and_pred_x0(self, x, e_t, a_t, a_prev):
+    temperature = 1
+    sigma_t = 0
+    sqrt_one_minus_at = (1-a_t).sqrt()
+    #print(a_t, a_prev, sigma_t, sqrt_one_minus_at)
+
+    pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+
+    # direction pointing to x_t
+    dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
+
+    x_prev = a_prev.sqrt() * pred_x0 + dir_xt
+    return x_prev, pred_x0
+
+  def get_model_output(self, unconditional_context, context, latent, timestep, unconditional_guidance_scale):
+    # put into diffuser
+    latents = self.model.diffusion_model(latent.expand(2, *latent.shape[1:]), timestep, unconditional_context.cat(context, dim=0))
+    unconditional_latent, latent = latents[0:1], latents[1:2]
+
+    e_t = unconditional_latent + unconditional_guidance_scale * (latent - unconditional_latent)
+    return e_t
+
+  def decode(self, x):
+    x = self.first_stage_model.post_quant_conv(1/0.18215 * x)
+    x = self.first_stage_model.decoder(x)
+
+    # make image correct size and scale
+    x = (x + 1.0) / 2.0
+    x = x.reshape(3,512,512).permute(1,2,0).clip(0,1)*255
+    return x.cast(dtypes.uint8) if Device.DEFAULT != "WEBGPU" else x
+
+  def __call__(self, unconditional_context, context, latent, timestep, alphas, alphas_prev, guidance):
+    e_t = self.get_model_output(unconditional_context, context, latent, timestep, guidance)
+    x_prev, _ = self.get_x_prev_and_pred_x0(latent, e_t, alphas, alphas_prev)
+    #e_t_next = get_model_output(x_prev)
+    #e_t_prime = (e_t + e_t_next) / 2
+    #x_prev, pred_x0 = get_x_prev_and_pred_x0(latent, e_t_prime, index)
+    return x_prev.realize()
 
 # ** ldm.models.autoencoder.AutoencoderKL (done!)
 # 3x512x512 <--> 4x64x64 (16384)
@@ -595,65 +615,31 @@ if __name__ == "__main__":
   # done with clip model
   del model.cond_stage_model
 
-  def get_model_output(latent, timestep, unconditional_guidance_scale):
-    # put into diffuser
-    latents = model.model.diffusion_model(latent.expand(2, *latent.shape[1:]), timestep, unconditional_context.cat(context, dim=0))
-    unconditional_latent, latent = latents[0:1], latents[1:2]
-
-    e_t = unconditional_latent + unconditional_guidance_scale * (latent - unconditional_latent)
-    return e_t
-
   timesteps = list(range(1, 1000, 1000//args.steps))
   print(f"running for {timesteps} timesteps")
   alphas = model.alphas_cumprod[Tensor(timesteps)]
   alphas_prev = Tensor([1.0]).cat(alphas[:-1])
 
-  def get_x_prev_and_pred_x0(x, e_t, index):
-    temperature = 1
-    a_t, a_prev = alphas[index], alphas_prev[index]
-    sigma_t = 0
-    sqrt_one_minus_at = (1-a_t).sqrt()
-    #print(a_t, a_prev, sigma_t, sqrt_one_minus_at)
-
-    pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-
-    # direction pointing to x_t
-    dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-
-    x_prev = a_prev.sqrt() * pred_x0 + dir_xt
-    return x_prev, pred_x0
-
-  @TinyJit
-  def do_step(latent, timestep, index, guidance):
-    e_t = get_model_output(latent, timestep, guidance)
-    x_prev, _ = get_x_prev_and_pred_x0(latent, e_t, index)
-    #e_t_next = get_model_output(x_prev)
-    #e_t_prime = (e_t + e_t_next) / 2
-    #x_prev, pred_x0 = get_x_prev_and_pred_x0(latent, e_t_prime, index)
-    return x_prev.realize()
-
   # start with random noise
   if args.seed is not None: Tensor._seed = args.seed
   latent = Tensor.randn(1,4,64,64)
 
+  @TinyJit
+  def run(model, *x): return model(*x).realize()
+
+  # this is diffusion
   with Context(BEAM=getenv("LATEBEAM")):
-    # this is diffusion
     for index, timestep in (t:=tqdm(list(enumerate(timesteps))[::-1])):
       GlobalCounters.reset()
       t.set_description("%3d %3d" % (index, timestep))
       with Timing("step in ", enabled=args.timing, on_exit=lambda _: f", using {GlobalCounters.mem_used/1e9:.2f} GB"):
-        latent = do_step(latent, Tensor([timestep]), Tensor([index]), Tensor([args.guidance]))
+        tid = Tensor([index])
+        latent = run(model, unconditional_context, context, latent, Tensor([timestep]), alphas[tid], alphas_prev[tid], Tensor([args.guidance]))
         if args.timing: Device[Device.DEFAULT].synchronize()
-    del do_step
+    del run
 
   # upsample latent space to image with autoencoder
-  x = model.first_stage_model.post_quant_conv(1/0.18215 * latent)
-  x = model.first_stage_model.decoder(x)
-
-  # make image correct size and scale
-  x = (x + 1.0) / 2.0
-  x = (x.reshape(3,512,512).permute(1,2,0).clip(0,1)*255)
-  if Device.DEFAULT != "WEBGPU": x = x.cast(dtypes.uint8)
+  x = model.decode(latent)
   print(x.shape)
 
   # save image

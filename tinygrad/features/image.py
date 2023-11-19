@@ -112,8 +112,7 @@ def fix_schedule_for_images(schedule:List[ScheduleItem]):
       si.out.dtype = dtypes.float32
     for b in si.ast.get_lazyops():
       if b.op != BufferOps.MEM: continue
-      # TODO: unit_stride axes will fail if there's a mask, even if the mask is divisble by four. this is too aggressive
-      if isinstance(si.inputs[b.arg.idx-1].dtype, ImageDType) and (b.arg.st.real_offset() % 4 != 0 or not any(b.arg.st.shape[x]%4 == 0 for x in b.arg.st.unit_stride_axes())):
+      if isinstance(si.inputs[b.arg.idx-1].dtype, ImageDType) and not any(b.arg.st.shape[x]%4 == 0 for x in b.arg.st.unit_stride_axes()):
         if DEBUG >= 1: print(f"{i:3d}: rewrite input, image dtype {si.inputs[b.arg.idx-1].dtype}, {b.arg.st.views}")
         if si.inputs[b.arg.idx-1].realized:
           # have to copy it
@@ -163,7 +162,8 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node) -> Tuple[Tup
   if valid.min == 0 and isinstance(idxy, SumNode):
     nodes = valid.nodes if isinstance(valid, AndNode) else [valid]
     val_dict: Dict[Node, Any] = {}
-    idxy_flat_var = [(i, i.vars()[0]) for i in idxy.flat_components if not isinstance(i, NumNode)]
+    # TODO: is this correct? should it check there's only one variable from each component?
+    idxy_flat_var = [(i, list(i.vars())[0]) for i in idxy.flat_components if not isinstance(i, NumNode)]
 
     for node in nodes:
       assert isinstance(node, LtNode)

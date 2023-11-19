@@ -1,6 +1,6 @@
 import os, atexit, functools
 try:
-  import networkx as nx  # type: ignore
+  import networkx as nx
 except ImportError:
   nx = None # graph won't work
 from collections import defaultdict
@@ -8,6 +8,8 @@ from typing import Dict, List
 from tinygrad.ops import ScheduleItem, UnaryOps, BinaryOps, ReduceOps, MovementOps, LoadOps, BufferOps, TernaryOps, Op, OpType, LazyOp
 from tinygrad.helpers import GRAPH, GRAPHPATH, DEBUG, GlobalCounters, getenv, dedup
 from tinygrad.codegen.linearizer import UOps
+from tinygrad.shape.shapetracker import ShapeTracker
+from tinygrad.shape.symbolic import NumNode
 
 # **** debugging and graphing ****
 
@@ -47,11 +49,12 @@ def str_dtype(dtyp):
   return "" if ret == 'float' else f"\n{ret}"
 
 @functools.lru_cache(None)
-def add_st_node(nmx, nmo, label, st):
+def add_st_node(nmx, nmo, label, st:ShapeTracker):
   global node_count
   inter_node = node_count
   node_count += 1
-  G.add_node(inter_node, style='filled', fillcolor="#80ff8080", color="black", label=f"{st.shape}\n{st.real_strides()}" + (f"\n{st.real_offset()}" if st.real_offset() != 0 else ""))
+  offset = st.expr_node(NumNode(0))[0]
+  G.add_node(inter_node, style='filled', fillcolor="#80ff8080", color="black", label=f"{st.shape}\n{st.real_strides()}" + (f"\n{offset}" if offset != 0 else ""))
   G.add_edge(nmx, inter_node, color='#00000060')
   G.add_edge(inter_node, nmo, label=label, color='#00000060')
 
@@ -77,7 +80,7 @@ def log_schedule_item(si: ScheduleItem):
       if lo.op != BufferOps.MEM: continue
       input_to_st[si.inputs[lo.arg.idx-1]].append(lo.arg.st)
 
-    # add them to the graph, potentially with a movement op seperating them
+    # add them to the graph, potentially with a movement op separating them
     for x in input_to_st:
       for st in dedup(input_to_st[x]):
         if st.contiguous:
@@ -107,11 +110,12 @@ def print_tree(lazydata:LazyOp): print("\n".join([f"{str(i).rjust(3)} {s}" for i
 def graph_uops(uops):
   colors = {UOps.ALU: "#ffffc0", UOps.LOAD: "#ffc0c0", UOps.STORE: "#c0ffc0", UOps.SPECIAL: "#c0c0ff", UOps.CONST: "#e0e0e0",
             UOps.DEFINE_GLOBAL: "#ffe0b0", UOps.DEFINE_LOCAL: "#ffe0d0", UOps.DEFINE_ACC: "#f0ffe0",
-            UOps.LOOP: "#c8a0e0", UOps.PHI: "#e0ffc0"}
+            UOps.LOOP: "#c8a0e0", UOps.PHI: "#e0ffc0", UOps.BARRIER: "#ff8080", UOps.IF: "#c8b0c0"}
   G = nx.DiGraph()
   for u in uops:
-    G.add_node(u.num, label=f"{str(u.uop)[5:]}{(' '+str(u.arg)) if u.arg is not None else ''}\n{str(u.dtype)}", style="filled", fillcolor=colors.get(u.uop, "#ffffff"))
-    for v in u.vin: G.add_edge(v.num, u.num)
+    if u.uop == UOps.END: continue
+    G.add_node(uops.index(u), label=f"{str(u.uop)[5:]}{(' '+str(u.arg)) if u.arg is not None else ''}\n{str(u.dtype)}", style="filled", fillcolor=colors.get(u.uop, "#ffffff"))
+    for v in u.vin: G.add_edge(uops.index(v), uops.index(u))
   GRAPHPATH = "/tmp/uops"
   nx.drawing.nx_pydot.write_dot(G, f'{GRAPHPATH}.dot')
   os.system(f'dot -Grankdir=LR -Tsvg {GRAPHPATH}.dot -o {GRAPHPATH}.svg')

@@ -1,6 +1,6 @@
 import unittest
 from tinygrad.shape.shapetracker import ShapeTracker, View
-from tinygrad.shape.symbolic import Variable
+from tinygrad.shape.symbolic import Variable, NumNode
 from tinygrad.tensor import Tensor
 
 class TestSymbolic(unittest.TestCase):
@@ -55,7 +55,7 @@ class TestSymbolicVarVals(unittest.TestCase):
   def test_var_vals_offset(self):
     x = Variable("x", 1, 100).bind(3)
     st = ShapeTracker.from_shape((4, 3)).shrink(((x, x+1), (0, 3)))
-    assert st.real_offset() == x * 3
+    assert st.views[-1].offset == x * 3
     assert st.var_vals == {Variable("x", 1, 100): 3}
 
   def test_var_vals_mask(self):
@@ -69,7 +69,7 @@ class TestSymbolicVarVals(unittest.TestCase):
     y = Variable("y", 1, 100).bind(4)
     z = Variable("z", 1, 100).bind(5)
     st = ShapeTracker.from_shape((x, 5, y)).shrink(((0, x), (z, z+1), (0, 3)))
-    assert st.real_offset() == y * z
+    assert st.views[-1].offset == y * z
     assert st.var_vals == {Variable("x", 1, 100): 3, Variable("y", 1, 100):4, Variable("z", 1, 100): 5}
 
   def test_shrink_reshape(self):
@@ -135,9 +135,8 @@ class TestSymbolicReshape(unittest.TestCase):
 
 class TestSymbolicExpand(unittest.TestCase):
   def test_expand_into_symbols(self):
-    # TODO: enfore expand only into bound variables
-    vi = Variable("i", 1, 5)
-    vj = Variable("j", 1, 5)
+    vi = Variable("i", 1, 5).bind(3)
+    vj = Variable("j", 1, 5).bind(3)
     a = Tensor([[1], [2], [3]]).expand((3, vi))
     assert a.shape == (3, vi)
     a = a.reshape(3, vi, 1).expand((3, vi, vj))
@@ -162,7 +161,7 @@ class TestSymbolicShapeExpr(unittest.TestCase):
     i = Variable("i", 1, 120)
     gidx0 = Variable("gidx0", 0, i)
     lidx1 = Variable("lidx1", 0, 7)
-    idx = (gidx0, lidx1, Variable.num(1))
+    idx = (gidx0, lidx1, NumNode(1))
     shape = (i+1, 8, 4)
     strides = (1, (i*4)+4, i+1)
     st = ShapeTracker((View.create(shape, strides), ))
