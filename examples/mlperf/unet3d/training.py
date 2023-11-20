@@ -4,7 +4,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters
 
-from models.unet3d import UNet3D
+from extra.models.unet3d import UNet3D
 from extra.datasets.kits19 import iterate, sliding_window_inference
 from examples.mlperf.metrics import get_dice_score
 from examples.mlperf.unet3d.data.loader import get_data_loaders
@@ -19,7 +19,7 @@ optimizer = optim.SGD(get_parameters(model), lr=init_lr)
 for i, (X, y_true) in enumerate(tqdm(train_loader)):
 	optimizer.zero_grad()
 
-	X = Tensor(X).half()
+	X = Tensor(X)
 	y_pred = model(X)
 
 	loss = dice_ce_loss(y_pred, y_true)

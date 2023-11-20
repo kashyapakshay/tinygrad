@@ -111,3 +111,4 @@ def get_data_loaders(path, train_bs=1, val_bs=1):
 
 if __name__ == '__main__':
     train_loader, val_loader = get_data_loaders('extra/datasets/kits19/processed_data')
+    print(next(val_loader))

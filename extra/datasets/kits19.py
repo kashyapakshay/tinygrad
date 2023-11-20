@@ -26,7 +26,9 @@ mv kits extra/datasets
 @functools.lru_cache(None)
 def get_val_files():
   data = requests.get("https://raw.githubusercontent.com/mlcommons/training/master/image_segmentation/pytorch/evaluation_cases.txt")
-  return sorted([x for x in BASEDIR.iterdir() if x.stem.split("_")[-1] in data.text.split("\n")])
+  val_split = data.text.split("\n")
+  file_ids = sorted([x.stem.split("_")[-1] for x in BASEDIR.iterdir()])
+  return [fid for fid in file_ids if fid in val_split]
 
 def load_pair(file_path):
   file_path = Path(file_path)
