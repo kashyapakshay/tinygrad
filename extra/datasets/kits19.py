@@ -26,9 +26,12 @@ mv kits extra/datasets
 @functools.lru_cache(None)
 def get_val_files():
   data = requests.get("https://raw.githubusercontent.com/mlcommons/training/master/image_segmentation/pytorch/evaluation_cases.txt")
-  return sorted([x for x in BASEDIR.iterdir() if x.stem.split("_")[-1] in data.text.split("\n")])
+  val_split = data.text.split("\n")
+  file_ids = sorted([x.stem.split("_")[-1] for x in BASEDIR.iterdir()])
+  return [fid for fid in file_ids if fid in val_split]
 
 def load_pair(file_path):
+  file_path = Path(file_path)
   image, label = nib.load(file_path / "imaging.nii.gz"), nib.load(file_path / "segmentation.nii.gz")
   image_spacings = image.header["pixdim"][1:4].tolist()
   image, label = image.get_fdata().astype(np.float32), label.get_fdata().astype(np.uint8)
@@ -53,10 +56,9 @@ def normal_intensity(image, min_clip=-79.0, max_clip=304.0, mean=101.0, std=76.9
 def pad_to_min_shape(image, label, roi_shape=(128, 128, 128)):
   current_shape = image.shape[1:]
   bounds = [max(0, roi_shape[i] - current_shape[i]) for i in range(3)]
-  paddings = [(0, 0)] + [(bounds[i] // 2, bounds[i] - bounds[i] // 2) for i in range(3)]
-  image = np.pad(image, paddings, mode="edge")
-  label = np.pad(label, paddings, mode="edge")
-  return image, label
+  paddings = [(0, 0)]
+  paddings.extend([(bounds[i] // 2, bounds[i] - bounds[i] // 2) for i in range(3)])
+  return np.pad(image, paddings, mode="edge"), np.pad(label, paddings, mode="edge")
 
 def preprocess(file_path):
   image, label, image_spacings = load_pair(file_path)
